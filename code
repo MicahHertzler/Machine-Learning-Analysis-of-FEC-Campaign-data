@@ -1,0 +1,724 @@
+"""
+================================================================================
+FEC Election Analysis — Full Model Suite
+================================================================================
+Consolidates every model and analysis method used across the conversation.
+
+Sections:
+  1.  Data loading & cleaning
+  2.  Feature engineering
+  3.  PVI district mapping
+  4.  Random Forest  (all districts)
+  5.  Gradient Boosting  (all districts)
+  6.  Logistic Regression  (all districts)
+  7.  Learning curves / sample-size analysis
+  8.  Demographic isolation methods (3 approaches)
+  9.  District-context models (Cook PVI features)
+  10. Swing-district subgroup analysis
+  11. Age analysis — linear, decade bins, 5-year bins
+  12. Party removal analysis
+  13. Religion classification analysis
+  14. Power analysis (rows needed per signal)
+  15. Full model comparison table
+
+Usage:
+  python fec_analysis.py --csv path/to/data.csv
+
+Outputs written to ./output/
+Supplemental tables referenced in paper: S1, S2, S3
+================================================================================
+"""
+
+import argparse
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.stats import norm
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import (
+    StratifiedKFold, cross_val_score, learning_curve, train_test_split
+)
+from sklearn.metrics import classification_report, accuracy_score, roc_auc_score
+
+warnings.filterwarnings("ignore")
+os.makedirs("output", exist_ok=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  COOK PVI MAP
+# ══════════════════════════════════════════════════════════════════════════════
+
+PVI_MAP = {
+    # Arizona
+    "AZ-01": -3,  "AZ-02": +5,  "AZ-03": +21, "AZ-04": -13,
+    "AZ-05": -15, "AZ-06": -2,  "AZ-07": +24, "AZ-08": -10, "AZ-09": +3,
+    # California
+    "CA-01": -11, "CA-02": +21, "CA-03": -5,  "CA-04": +3,  "CA-05": +27,
+    "CA-06": +14, "CA-07": +14, "CA-08": +17, "CA-09": +12, "CA-10": +7,
+    "CA-11": +36, "CA-12": +40, "CA-13": +3,  "CA-14": +24, "CA-15": +22,
+    "CA-16": +18, "CA-17": +24, "CA-18": +16, "CA-19": +6,  "CA-20": +32,
+    "CA-21": -13, "CA-22": -1,  "CA-23": -16, "CA-24": +9,  "CA-25": -2,
+    "CA-26": +17, "CA-27": -1,  "CA-28": +20, "CA-29": +34, "CA-30": +25,
+    "CA-31": +21, "CA-32": +34, "CA-33": +38, "CA-34": +37, "CA-35": +38,
+    "CA-36": +16, "CA-37": +37, "CA-38": +14, "CA-39": +10, "CA-40": -3,
+    "CA-41": +1,  "CA-42": -7,  "CA-43": +37, "CA-44": +38, "CA-45": 0,
+    "CA-46": +32, "CA-47": +3,  "CA-48": -2,  "CA-49": +4,  "CA-50": -12,
+    "CA-51": +35, "CA-52": +22,
+    # Colorado
+    "CO-01": +28, "CO-02": +10, "CO-03": -18, "CO-04": -18,
+    "CO-05": -17, "CO-06": +7,  "CO-07": +1,  "CO-08": -2,
+    # Connecticut
+    "CT-01": +14, "CT-02": +2,  "CT-03": +12, "CT-04": +6,  "CT-05": +3,
+    # Florida
+    "FL-01": -24, "FL-02": -21, "FL-03": -17, "FL-04": -20, "FL-05": -16,
+    "FL-06": -16, "FL-07": +2,  "FL-08": -22, "FL-09": +12, "FL-10": +24,
+    "FL-11": -22, "FL-12": -14, "FL-13": -2,  "FL-14": -14, "FL-15": -7,
+    "FL-16": -14, "FL-17": -22, "FL-18": -17, "FL-19": -22, "FL-20": +33,
+    "FL-21": -22, "FL-22": -10, "FL-23": +14, "FL-24": +30, "FL-25": -14,
+    "FL-26": -10, "FL-27": +1,  "FL-28": -10,
+    # Georgia
+    "GA-01": -16, "GA-02": +14, "GA-03": -22, "GA-04": +34, "GA-05": +38,
+    "GA-06": -6,  "GA-07": -3,  "GA-08": -24, "GA-09": -33, "GA-10": -22,
+    "GA-11": -15, "GA-12": -16, "GA-13": +24, "GA-14": -33,
+    # Idaho
+    "ID-01": -22, "ID-02": -18,
+    # Illinois
+    "IL-01": +34, "IL-02": +37, "IL-03": +16, "IL-04": +38, "IL-05": +28,
+    "IL-06": +6,  "IL-07": +40, "IL-08": +10, "IL-09": +28, "IL-10": +12,
+    "IL-11": +8,  "IL-12": -14, "IL-13": -4,  "IL-14": +2,  "IL-15": -22,
+    "IL-16": -18, "IL-17": -1,  "IL-18": -14,
+    # Indiana
+    "IN-01": +8,  "IN-02": -14, "IN-03": -22, "IN-04": -22, "IN-05": -10,
+    "IN-06": -22, "IN-07": +22, "IN-08": -20, "IN-09": -20,
+    # Iowa
+    "IA-01": -6,  "IA-02": -4,  "IA-03": -4,  "IA-04": -22,
+    # Kansas
+    "KS-01": -30, "KS-02": -14, "KS-03": +2,  "KS-04": -22,
+    # Kentucky
+    "KY-01": -32, "KY-02": -26, "KY-03": +12, "KY-04": -26,
+    "KY-05": -36, "KY-06": -16,
+    # Maine
+    "ME-01": +8,  "ME-02": -6,
+    # Maryland
+    "MD-01": -16, "MD-02": +20, "MD-03": +20, "MD-04": +38,
+    "MD-05": +18, "MD-06": +8,  "MD-07": +38, "MD-08": +24,
+    # Michigan
+    "MI-01": -14, "MI-02": -18, "MI-03": -4,  "MI-04": -14, "MI-05": -10,
+    "MI-06": +6,  "MI-07": -2,  "MI-08": -2,  "MI-09": +6,  "MI-10": -4,
+    "MI-11": +4,  "MI-12": +20, "MI-13": +32,
+    # Minnesota
+    "MN-01": -8,  "MN-02": -4,  "MN-03": +4,  "MN-04": +26, "MN-05": +34,
+    "MN-06": -16, "MN-07": -22, "MN-08": -12,
+    # Missouri
+    "MO-01": +34, "MO-02": -14, "MO-03": -20, "MO-04": -24,
+    "MO-05": +16, "MO-06": -22, "MO-07": -28, "MO-08": -32,
+    # Nevada
+    "NV-01": +14, "NV-02": -10, "NV-03": -2,  "NV-04": +2,
+    # New Hampshire
+    "NH-01": +2,  "NH-02": +4,
+    # New Jersey
+    "NJ-01": +12, "NJ-02": -10, "NJ-03": -1,  "NJ-04": -10, "NJ-05": +4,
+    "NJ-06": +14, "NJ-07": -2,  "NJ-08": +24, "NJ-09": +16, "NJ-10": +38,
+    "NJ-11": +6,  "NJ-12": +20,
+    # New Mexico
+    "NM-01": +10, "NM-02": -6,  "NM-03": +16,
+    # New York
+    "NY-01": -8,  "NY-02": -6,  "NY-03": -1,  "NY-04": +6,  "NY-05": +36,
+    "NY-06": +36, "NY-07": +38, "NY-08": +40, "NY-09": +32, "NY-10": +38,
+    "NY-11": -4,  "NY-12": +34, "NY-13": +22, "NY-14": +24, "NY-15": +40,
+    "NY-16": +14, "NY-17": -2,  "NY-18": +2,  "NY-19": -3,  "NY-20": +8,
+    "NY-21": -12, "NY-22": -4,  "NY-23": -14, "NY-24": -14, "NY-25": +18,
+    "NY-26": +20,
+    # North Carolina
+    "NC-01": +2,  "NC-02": -8,  "NC-03": -20, "NC-04": +22, "NC-05": -18,
+    "NC-06": +8,  "NC-07": -16, "NC-08": -18, "NC-09": -14, "NC-10": -22,
+    "NC-11": -22, "NC-12": +28, "NC-13": -4,  "NC-14": -4,
+    # Ohio
+    "OH-01": -6,  "OH-02": -20, "OH-03": +24, "OH-04": -26, "OH-05": -22,
+    "OH-06": -22, "OH-07": -14, "OH-08": -24, "OH-09": +14, "OH-10": -14,
+    "OH-11": +36, "OH-12": -8,  "OH-13": +6,  "OH-14": -14, "OH-15": -16,
+    # Oregon
+    "OR-01": +10, "OR-02": -18, "OR-03": +34, "OR-04": +4,
+    "OR-05": -1,  "OR-06": +1,
+    # Pennsylvania
+    "PA-01": +12, "PA-02": +36, "PA-03": +20, "PA-04": +22, "PA-05": +24,
+    "PA-06": +8,  "PA-07": +2,  "PA-08": -6,  "PA-09": -24, "PA-10": -10,
+    "PA-11": -18, "PA-12": +26, "PA-13": -14, "PA-14": -26, "PA-15": -20,
+    "PA-16": -18, "PA-17": -1,
+    # South Carolina
+    "SC-01": -12, "SC-02": -18, "SC-03": -24, "SC-04": -22,
+    "SC-05": -14, "SC-06": +18, "SC-07": -18,
+    # Tennessee
+    "TN-01": -32, "TN-02": -26, "TN-03": -24, "TN-04": -22,
+    "TN-05": -4,  "TN-06": -24, "TN-07": -22, "TN-08": -26, "TN-09": +28,
+    # Texas
+    "TX-01": -28, "TX-02": -14, "TX-03": -16, "TX-04": -30, "TX-05": -22,
+    "TX-06": -14, "TX-07": -4,  "TX-08": -30, "TX-09": +32, "TX-10": -18,
+    "TX-11": -36, "TX-12": -22, "TX-13": -38, "TX-14": -24, "TX-15": -4,
+    "TX-16": +22, "TX-17": -22, "TX-18": +30, "TX-19": -34, "TX-20": +26,
+    "TX-21": -14, "TX-22": -14, "TX-23": -8,  "TX-24": -10, "TX-25": -22,
+    "TX-26": -20, "TX-27": -22, "TX-28": -2,  "TX-29": +22, "TX-30": +36,
+    "TX-31": -16, "TX-32": +2,  "TX-33": +32, "TX-34": -4,  "TX-35": +26,
+    "TX-36": -30, "TX-37": +24, "TX-38": -18,
+    # Utah
+    "UT-01": -22, "UT-02": -14, "UT-03": -22, "UT-04": -6,
+    # Virginia
+    "VA-01": -12, "VA-02": -4,  "VA-03": +22, "VA-04": +22, "VA-05": -16,
+    "VA-06": -22, "VA-07": +4,  "VA-08": +22, "VA-09": -28, "VA-10": +6,
+    "VA-11": +18,
+    # Washington
+    "WA-01": +12, "WA-02": +14, "WA-03": -6,  "WA-04": -20, "WA-05": -14,
+    "WA-06": +8,  "WA-07": +36, "WA-08": +4,  "WA-09": +32, "WA-10": +14,
+    # Wisconsin
+    "WI-01": -10, "WI-02": +22, "WI-03": -6,  "WI-04": +28, "WI-05": -18,
+    "WI-06": -14, "WI-07": -16, "WI-08": -18,
+    # Alabama / Alaska / Arkansas
+    "AK-00": -9,
+    "AL-01": -16, "AL-02": -16, "AL-03": -20, "AL-04": -33,
+    "AL-05": -14, "AL-06": -21, "AL-07": +29,
+    "AR-01": -21, "AR-02": -11, "AR-03": -21, "AR-04": -23,
+    # Mississippi
+    "MS-01": -24, "MS-02": +14, "MS-03": -22, "MS-04": -24,
+    # Old-format fallbacks
+    "Georgia 13": +24, "Georgia 14": -33,
+    "Hawaii 1":   +30, "Hawaii 2":   +28,
+    "Kentucky 1": -32, "Kentucky 6": -16,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  DATA LOADING & CLEANING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_and_clean(csv_path: str) -> pd.DataFrame:
+    """Load FEC CSV, standardise columns, return clean DataFrame."""
+    df = pd.read_csv(csv_path)
+
+    # ── party ───────────────────────────────────────────────────────────────
+    party_map = {
+        "REP": "Republican", "DEM": "Democratic", "Democrat": "Democratic",
+        "Republican": "Republican", "Democratic": "Democratic", "DFL": "Democratic",
+    }
+    df["party_clean"] = df["political_party"].map(party_map).fillna("Other")
+
+    # ── age ─────────────────────────────────────────────────────────────────
+    df["age_clean"] = pd.to_numeric(df["age_at_given_year"], errors="coerce")
+    df["age_clean"] = df["age_clean"].where(df["age_clean"].between(22, 85))
+
+    # ── target ──────────────────────────────────────────────────────────────
+    df["target_raw"] = df["won_or_lost_house_race_for_given_year"].str.strip()
+    df.loc[df["target_raw"].str.contains("Won special election", na=False), "target_raw"] = "Won"
+
+    # ── filter ──────────────────────────────────────────────────────────────
+    df = df[df["target_raw"].isin(["Won", "Lost"])].copy()
+    df = df[df["party_clean"].isin(["Democratic", "Republican"])].copy()
+
+    # ── PVI ─────────────────────────────────────────────────────────────────
+    df["district_pvi"] = df["location"].map(PVI_MAP)
+
+    # ── financial ───────────────────────────────────────────────────────────
+    for col in ["campaign_spending_2023_2024", "Total_Disbursement",
+                "total_receipts_weball24", "weball24_ie_supporting",
+                "weball24_ie_opposing", "weball24_cash_on_hand_end",
+                "weball24_debts_owed_by"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    print(f"[load] rows={len(df)}  "
+          f"Won={( df['target_raw']=='Won').sum()}  "
+          f"Lost={(df['target_raw']=='Lost').sum()}  "
+          f"PVI-mapped={(df['district_pvi'].notna()).sum()}")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  FEATURE ENGINEERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all model features in-place."""
+
+    def prev_win(text):
+        t = str(text).lower()
+        return 1 if t[:3] == "won" else (0 if t[:4] == "lost" else -1)
+
+    df["prev_win"]    = df["candidate_previous_election_results_based_on_given_year"].apply(prev_win)
+    df["is_dem"]      = (df["party_clean"] == "Democratic").astype(int)
+    df["is_female"]   = (df["gender"].str.lower().str.strip() == "female").astype(int)
+    df["has_religion"]= df["stated_religion_if_found"].notna().astype(int)
+    df["is_white"]    = (df["race_ethnicity_if_found"].fillna("")
+                           .str.lower().str.contains("white|caucasian")).astype(int)
+    df["is_nonwhite"] = (df["race_ethnicity_if_found"].notna() &
+                         ~df["race_ethnicity_if_found"].fillna("")
+                          .str.lower().str.contains("white|caucasian")).astype(int)
+    df["age"]         = df["age_clean"].fillna(df["age_clean"].median())
+
+    # financial — use whichever column name is present
+    def get_col(d, *names):
+        for n in names:
+            if n in d.columns:
+                return d[n].fillna(0)
+        return pd.Series(0, index=d.index)
+
+    df["spending"]     = get_col(df, "campaign_spending_2023_2024")
+    df["disbursement"] = get_col(df, "Total_Disbursement", "weball24_disbursements")
+    df["receipts"]     = get_col(df, "total_receipts_weball24", "weball24_receipts")
+    df["ie_net"]       = (get_col(df, "weball24_ie_supporting") -
+                          get_col(df, "weball24_ie_opposing"))
+    df["cash_end"]     = get_col(df, "weball24_cash_on_hand_end")
+    df["debt"]         = get_col(df, "weball24_debts_owed_by")
+
+    # district features (only rows with PVI)
+    pvi_mask = df["district_pvi"].notna()
+    df.loc[pvi_mask, "district_safety"] = df.loc[pvi_mask, "district_pvi"].abs()
+    df.loc[pvi_mask, "party_district_align"] = df.loc[pvi_mask].apply(
+        lambda r: r["district_pvi"] if r["is_dem"] == 1 else -r["district_pvi"], axis=1)
+    df.loc[pvi_mask, "is_underdog"] = (
+        ((df.loc[pvi_mask, "is_dem"] == 1) & (df.loc[pvi_mask, "district_pvi"] < 0)) |
+        ((df.loc[pvi_mask, "is_dem"] == 0) & (df.loc[pvi_mask, "district_pvi"] > 0))
+    ).astype(int)
+
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  SHARED CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+FEATURES_FINANCIAL = ["spending", "disbursement", "receipts", "ie_net",
+                       "cash_end", "debt", "prev_win"]
+
+FEATURES_DEMO      = ["is_dem", "is_female", "age", "is_white",
+                       "is_nonwhite", "has_religion"]
+
+FEATURES_DISTRICT  = ["district_pvi", "party_district_align",
+                       "district_safety", "is_underdog"]
+
+FEATURES_ALL       = FEATURES_FINANCIAL + FEATURES_DEMO + FEATURES_DISTRICT
+
+FEATURES_NO_PARTY  = [f for f in FEATURES_ALL if f != "is_dem"]
+
+CV = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+
+def make_models():
+    return {
+        "Logistic Regression": LogisticRegression(
+            class_weight="balanced", max_iter=1000, C=0.5),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300, random_state=42, class_weight="balanced"),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=200, max_depth=3, random_state=42),
+    }
+
+
+def evaluate_models(X, y, label=""):
+    """Run 5-fold CV for all three models. Returns results dict."""
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    results = {}
+    print(f"\n{'─'*60}")
+    print(f"  {label}  (n={len(y)}, won={y.sum()}, lost={(y==0).sum()})")
+    print(f"{'─'*60}")
+    print(f"  {'Model':<25} {'AUC':>7} {'Acc':>7} {'F1':>7}")
+    for name, model in make_models().items():
+        auc = cross_val_score(model, Xs, y, cv=CV, scoring="roc_auc").mean()
+        acc = cross_val_score(model, Xs, y, cv=CV, scoring="accuracy").mean()
+        f1  = cross_val_score(model, Xs, y, cv=CV, scoring="f1").mean()
+        results[name] = {"auc": auc, "acc": acc, "f1": f1}
+        print(f"  {name:<25} {auc:>7.3f} {acc:>7.3f} {f1:>7.3f}")
+    return results, scaler
+
+
+def rf_importances(X, y, feature_names, scaler):
+    """Fit RF on full dataset, return importance Series."""
+    Xs = scaler.transform(X)
+    rf = RandomForestClassifier(n_estimators=300, random_state=42,
+                                 class_weight="balanced")
+    rf.fit(Xs, y)
+    return pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
+
+
+def lr_coefficients(X, y, feature_names, scaler):
+    """Fit LR on full dataset, return coefficient Series."""
+    Xs = scaler.transform(X)
+    lr = LogisticRegression(class_weight="balanced", max_iter=1000, C=0.5)
+    lr.fit(Xs, y)
+    return pd.Series(lr.coef_[0], index=feature_names).sort_values(key=abs, ascending=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  SECTION RUNNERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def section_all_districts(df):
+    """Models on all PVI-mapped D+R candidates."""
+    d = df[df["district_pvi"].notna()].copy()
+    y = (d["target_raw"] == "Won").astype(int)
+    feats = [f for f in FEATURES_ALL if f in d.columns]
+    X = d[feats].fillna(0)
+
+    results, scaler = evaluate_models(X, y, "ALL PVI-MAPPED DISTRICTS")
+
+    print("\n  RF Feature Importances — All Districts:")
+    imps = rf_importances(X, y, feats, scaler)
+    for feat, imp in imps.items():
+        bar = "█" * int(imp * 80)
+        print(f"    {feat:<28} {imp:.4f}  {bar}")
+
+    print("\n  LR Coefficients — All Districts:")
+    coefs = lr_coefficients(X, y, feats, scaler)
+    for feat, c in coefs.items():
+        print(f"    {feat:<28} {c:+.4f}  {'↑WIN' if c > 0 else '↓LOSE'}")
+
+    imps.to_csv("output/S1_rf_importances_all_districts.csv")
+    print("\n  → Supplemental Table S1 saved: output/S1_rf_importances_all_districts.csv")
+    return results
+
+
+def section_demographic_isolation(df):
+    """Three demographic isolation methods."""
+    d = df[df["district_pvi"].notna()].copy()
+    y = (d["target_raw"] == "Won").astype(int)
+    scaler = StandardScaler()
+
+    demo_feats = ["is_dem", "is_female", "age", "is_white",
+                  "is_nonwhite", "has_religion"]
+    conf_feats = [f for f in FEATURES_FINANCIAL + FEATURES_DISTRICT
+                  if f in d.columns]
+    all_feats  = [f for f in FEATURES_ALL if f in d.columns]
+
+    print(f"\n{'─'*60}")
+    print("  DEMOGRAPHIC ISOLATION METHODS")
+    print(f"{'─'*60}")
+
+    # Method 1 — demographics only
+    X1 = scaler.fit_transform(d[demo_feats].fillna(0))
+    lr1 = LogisticRegression(class_weight="balanced", max_iter=1000, C=0.1)
+    auc1 = cross_val_score(lr1, X1, y, cv=CV, scoring="roc_auc").mean()
+    print(f"\n  Method 1 — Demographics only          AUC = {auc1:.3f}")
+    lr1.fit(X1, y)
+    for f, c in sorted(zip(demo_feats, lr1.coef_[0]),
+                       key=lambda x: abs(x[1]), reverse=True):
+        print(f"    {f:<20} {c:+.4f}  {'↑WIN' if c > 0 else '↓LOSE'}")
+
+    # Method 2 — residualised
+    X_conf = scaler.fit_transform(d[conf_feats].fillna(0))
+    residuals = {}
+    for feat in demo_feats:
+        vals = d[feat].fillna(0).values.astype(float)
+        lr_r = LinearRegression().fit(X_conf, vals)
+        residuals[feat] = vals - lr_r.predict(X_conf)
+    X2 = scaler.fit_transform(pd.DataFrame(residuals))
+    lr2 = LogisticRegression(class_weight="balanced", max_iter=1000, C=0.1)
+    auc2 = cross_val_score(lr2, X2, y, cv=CV, scoring="roc_auc").mean()
+    print(f"\n  Method 2 — Residualised demographics  AUC = {auc2:.3f}")
+
+    # Method 3 — full model delta
+    X_money = scaler.fit_transform(d[conf_feats].fillna(0))
+    X_full  = scaler.fit_transform(d[all_feats].fillna(0))
+    lr_m = LogisticRegression(class_weight="balanced", max_iter=1000, C=0.1)
+    lr_f = LogisticRegression(class_weight="balanced", max_iter=1000, C=0.1)
+    auc_m = cross_val_score(lr_m, X_money, y, cv=CV, scoring="roc_auc").mean()
+    auc_f = cross_val_score(lr_f, X_full,  y, cv=CV, scoring="roc_auc").mean()
+    print(f"\n  Method 3 — AUC delta")
+    print(f"    Financial only:         {auc_m:.3f}")
+    print(f"    Financial + demo:       {auc_f:.3f}")
+    print(f"    Demographic added value: +{auc_f - auc_m:.3f}")
+
+
+def section_swing_districts(df):
+    """Full analysis restricted to PVI ±7 swing districts."""
+    d = df[(df["district_pvi"].notna()) &
+           (df["district_pvi"].abs() <= 7)].copy()
+    y = (d["target_raw"] == "Won").astype(int)
+
+    print(f"\n{'─'*60}")
+    print(f"  SWING DISTRICTS  (PVI ±7)  n={len(d)}")
+    print(f"{'─'*60}")
+
+    # ── with party ──────────────────────────────────────────────────────────
+    feats_w  = [f for f in FEATURES_ALL if f in d.columns]
+    X_w = d[feats_w].fillna(0)
+    results_w, scaler_w = evaluate_models(X_w, y, "Swing — WITH party (is_dem)")
+
+    imps_w = rf_importances(X_w, y, feats_w, scaler_w)
+    print("\n  RF Importances — Swing WITH party:")
+    for feat, imp in imps_w.items():
+        print(f"    {feat:<28} {imp:.4f}")
+
+    # ── without party ───────────────────────────────────────────────────────
+    feats_np = [f for f in FEATURES_NO_PARTY if f in d.columns]
+    X_np = d[feats_np].fillna(0)
+    results_np, scaler_np = evaluate_models(X_np, y, "Swing — WITHOUT party")
+
+    imps_np = rf_importances(X_np, y, feats_np, scaler_np)
+    print("\n  RF Importances — Swing WITHOUT party (Supplemental Table S1b):")
+    for feat, imp in imps_np.items():
+        bar = "█" * int(imp * 80)
+        print(f"    {feat:<28} {imp:.4f}  {bar}")
+    imps_np.to_csv("output/S1b_rf_importances_swing_no_party.csv")
+
+    # ── LR coefficients without party ───────────────────────────────────────
+    coefs_np = lr_coefficients(X_np, y, feats_np, scaler_np)
+    print("\n  LR Coefficients — Swing WITHOUT party:")
+    for feat, c in coefs_np.items():
+        print(f"    {feat:<28} {c:+.4f}  {'↑WIN' if c > 0 else '↓LOSE'}")
+
+    # ── demographic correlations ─────────────────────────────────────────────
+    print("\n  Point-biserial correlations — Swing:")
+    for feat in ["is_female", "is_white", "is_nonwhite", "has_religion",
+                 "age", "is_dem"]:
+        if feat not in d.columns:
+            continue
+        r, p = stats.pointbiserialr(y, d[feat].fillna(0))
+        sig = ("***" if p < 0.001 else "**" if p < 0.01
+               else "*" if p < 0.05 else "." if p < 0.10 else "")
+        print(f"    {feat:<20} r={r:+.3f}  p={p:.3f}  {sig}")
+
+    # ── win rates ───────────────────────────────────────────────────────────
+    print("\n  Win rates by group — Swing:")
+    for feat, label in [("is_female", "Female"), ("is_white", "White"),
+                        ("is_nonwhite", "Nonwhite"), ("is_dem", "Democrat")]:
+        if feat not in d.columns:
+            continue
+        g = d.groupby(feat)["target_raw"].value_counts(normalize=True).unstack().fillna(0)
+        if 1 in g.index and 0 in g.index and "Won" in g.columns:
+            print(f"    {label:<12} YES={g.loc[1,'Won']:.1%}  NO={g.loc[0,'Won']:.1%}")
+
+
+def section_age_analysis(df):
+    """Age — linear, decade bins, 5-year bins, party breakdown."""
+    d = df[(df["district_pvi"].notna()) &
+           (df["district_pvi"].abs() <= 7) &
+           (df["age_clean"].notna())].copy()
+    y = (d["target_raw"] == "Won").astype(int)
+
+    print(f"\n{'─'*60}")
+    print(f"  AGE ANALYSIS — Swing districts with valid age  n={len(d)}")
+    print(f"{'─'*60}")
+
+    # ── linear ──────────────────────────────────────────────────────────────
+    r_lin, p_lin = stats.pointbiserialr(y, d["age_clean"])
+    print(f"\n  Linear age correlation: r={r_lin:+.3f}  p={p_lin:.3f}")
+
+    # ── decade bins ─────────────────────────────────────────────────────────
+    d["decade"] = (d["age_clean"] // 10 * 10).astype(int)
+    dec_stats = d.groupby("decade").agg(
+        n=("target_raw", "count"),
+        won=("target_raw", lambda x: (x == "Won").sum())
+    ).reset_index()
+    dec_stats["win_rate"] = (dec_stats["won"] / dec_stats["n"] * 100).round(1)
+    print("\n  Decade win rates:")
+    print(dec_stats.to_string(index=False))
+    ct_dec = pd.crosstab(d["decade"], d["target_raw"])
+    chi2_d, p_d, dof_d, _ = stats.chi2_contingency(ct_dec)
+    print(f"  Chi-square (decades): chi2={chi2_d:.3f}  p={p_d:.4f}  dof={dof_d}")
+
+    # ── party within decade ──────────────────────────────────────────────────
+    print("\n  Party × decade win rates:")
+    print(d.groupby(["decade", "party_clean"])["target_raw"]
+           .value_counts(normalize=True).unstack().fillna(0).round(3))
+
+    # ── 5-year bins ──────────────────────────────────────────────────────────
+    bins5   = list(range(25, 86, 5))
+    labels5 = [f"{b}-{b+4}" for b in bins5[:-1]]
+    d["age_5yr"] = pd.cut(d["age_clean"], bins=bins5, labels=labels5, right=False)
+    s5 = d.groupby("age_5yr", observed=True).agg(
+        n=("target_raw", "count"),
+        won=("target_raw", lambda x: (x == "Won").sum())
+    ).reset_index()
+    s5["win_rate"] = (s5["won"] / s5["n"] * 100).round(1)
+    s5["status"]   = s5.apply(
+        lambda r: "SOLID" if r["n"] >= 10 and r["won"] >= 2 and (r["n"] - r["won"]) >= 2
+                  else "usable" if r["n"] >= 5 and r["won"] >= 1 and (r["n"] - r["won"]) >= 1
+                  else "too small", axis=1)
+    print("\n  5-year bin win rates:")
+    for _, r in s5[s5["n"] > 0].iterrows():
+        print(f"    {str(r['age_5yr']):<10} n={int(r['n']):>3}  won={int(r['won']):>3}"
+              f"  {r['win_rate']:>5}%  {r['status']}")
+
+    viable = s5[(s5["n"] >= 5) & (s5["won"] >= 1) & ((s5["n"] - s5["won"]) >= 1)]
+    if len(viable) >= 3:
+        df_v  = d[d["age_5yr"].isin(viable["age_5yr"].values)]
+        ct5   = pd.crosstab(df_v["age_5yr"], df_v["target_raw"])
+        chi2_5, p_5, dof_5, _ = stats.chi2_contingency(ct5)
+        print(f"  Chi-square (5-yr bins): chi2={chi2_5:.3f}  p={p_5:.4f}  dof={dof_5}")
+
+    s5.to_csv("output/S2_age_5yr_bins.csv", index=False)
+    print("  → Supplemental Figure S2 data saved: output/S2_age_5yr_bins.csv")
+
+
+def section_power_analysis():
+    """Statistical power — rows needed for each demographic signal."""
+
+    def power_for_r(r, n, alpha=0.05):
+        if abs(r) < 0.001 or n < 4:
+            return 0.0
+        zr  = np.arctanh(abs(r))
+        za  = norm.ppf(1 - alpha / 2)
+        ncp = zr * np.sqrt(n - 3)
+        return 1 - norm.cdf(za - ncp) + norm.cdf(-za - ncp)
+
+    def n_for_power(r, power=0.80, alpha=0.05):
+        if abs(r) < 0.001:
+            return float("inf")
+        zr   = np.arctanh(abs(r))
+        za   = norm.ppf(1 - alpha / 2)
+        zbeta = norm.ppf(power)
+        return int(np.ceil(((za + zbeta) / zr) ** 2 + 3))
+
+    signals = [
+        ("gender (is_female)",  -0.213, 88),
+        ("race (is_white)",     +0.208, 88),
+        ("district-race match", +0.108, 77),
+        ("age (linear)",        +0.047, 88),
+    ]
+
+    print(f"\n{'─'*60}")
+    print("  POWER ANALYSIS — rows needed per signal (swing districts)")
+    print(f"{'─'*60}")
+    print(f"  {'Signal':<25} {'r':>6} {'N now':>7} {'Power now':>10} "
+          f"{'N@80%':>8} {'N@90%':>8}")
+
+    rows = []
+    for label, r, n_now in signals:
+        pwr_now = power_for_r(r, n_now)
+        n80     = n_for_power(r, 0.80)
+        n90     = n_for_power(r, 0.90)
+        print(f"  {label:<25} {r:>+6.3f} {n_now:>7} {pwr_now:>9.1%} "
+              f"{n80:>8} {n90:>8}")
+        rows.append({"signal": label, "r": r, "n_current": n_now,
+                     "power_current": round(pwr_now, 3),
+                     "n_needed_80pct": n80, "n_needed_90pct": n90})
+
+    pd.DataFrame(rows).to_csv("output/S3_power_analysis.csv", index=False)
+    print("  → Supplemental Table S3 saved: output/S3_power_analysis.csv")
+
+
+def section_learning_curves(df):
+    """Learning curves to show how model improves with more data."""
+    d = df[df["district_pvi"].notna()].copy()
+    y = (d["target_raw"] == "Won").astype(int)
+    feats = [f for f in FEATURES_ALL if f in d.columns]
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(d[feats].fillna(0))
+
+    print(f"\n{'─'*60}")
+    print("  LEARNING CURVES  (ROC-AUC vs training size)")
+    print(f"{'─'*60}")
+
+    train_sizes = np.linspace(0.1, 1.0, 8)
+    for name, model in [
+        ("Logistic Regression",
+         LogisticRegression(class_weight="balanced", max_iter=1000, C=0.1)),
+        ("Random Forest",
+         RandomForestClassifier(n_estimators=200, random_state=42,
+                                 class_weight="balanced")),
+    ]:
+        tsz, tr_sc, val_sc = learning_curve(
+            model, Xs, y, train_sizes=train_sizes,
+            cv=CV, scoring="roc_auc", n_jobs=-1)
+        print(f"\n  {name}:")
+        print(f"  {'N':>6}  {'Train AUC':>10}  {'Val AUC':>10}  {'Gap':>8}")
+        for n, tr, vl in zip(tsz, tr_sc.mean(1), val_sc.mean(1)):
+            print(f"  {int(n):>6}  {tr:>10.3f}  {vl:>10.3f}  {tr-vl:>8.3f}")
+
+    rows = []
+    for n, tr, vl in zip(tsz, tr_sc.mean(1), val_sc.mean(1)):
+        rows.append({"n_train": int(n), "train_auc": round(tr, 3),
+                     "val_auc": round(vl, 3)})
+    pd.DataFrame(rows).to_csv("output/learning_curve_rf.csv", index=False)
+
+
+def section_religion(df):
+    """Religion classification and win rates."""
+
+    def classify(val):
+        if pd.isna(val) or str(val).strip() in ("", "nan", "None", "unknown"):
+            return "Unknown"
+        v = str(val).lower()
+        for kw in ["catholic", "protestant", "baptist", "methodist", "evangelical",
+                   "lutheran", "presbyterian", "episcopal", "mormon", "lds",
+                   "christian", "pentecostal", "reformed", "anglican", "adventist",
+                   "church of christ", "nondenominational", "born again"]:
+            if kw in v:
+                return "Christian"
+        for kw in ["jewish", "judaism"]:
+            if kw in v:
+                return "Jewish"
+        for kw in ["muslim", "islam"]:
+            if kw in v:
+                return "Muslim"
+        for kw in ["hindu"]:
+            if kw in v:
+                return "Hindu"
+        return "Other"
+
+    df["religion_cat"] = df["stated_religion_if_found"].apply(classify)
+    y = (df["target_raw"] == "Won").astype(int)
+
+    print(f"\n{'─'*60}")
+    print("  RELIGION ANALYSIS")
+    print(f"{'─'*60}")
+    grp = df.groupby("religion_cat")["target_raw"].value_counts(
+        normalize=True).unstack().fillna(0)
+    grp["n"] = df["religion_cat"].value_counts()
+    print(grp.sort_values("Won", ascending=False).round(3).to_string())
+
+    valid = df["religion_cat"].value_counts()
+    valid = valid[valid >= 5].index
+    df_v  = df[df["religion_cat"].isin(valid)]
+    if len(valid) >= 2:
+        ct = pd.crosstab(df_v["religion_cat"], df_v["target_raw"])
+        chi2, p, dof, _ = stats.chi2_contingency(ct)
+        print(f"\n  Chi-square: chi2={chi2:.3f}  p={p:.4f}  dof={dof}")
+
+    df[["religion_cat", "target_raw"]].to_csv(
+        "output/S3_religion_breakdown.csv", index=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="FEC Election Analysis")
+    parser.add_argument("--csv", required=True,
+                        help="Path to enriched FEC CSV file")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("  FEC ELECTION ANALYSIS — FULL MODEL SUITE")
+    print("=" * 60)
+
+    df = load_and_clean(args.csv)
+    df = engineer_features(df)
+
+    section_all_districts(df)
+    section_demographic_isolation(df)
+    section_swing_districts(df)
+    section_age_analysis(df)
+    section_power_analysis()
+    section_learning_curves(df)
+    section_religion(df)
+
+    print(f"\n{'='*60}")
+    print("  COMPLETE — outputs written to ./output/")
+    print("  Supplemental files:")
+    print("    S1  output/S1_rf_importances_all_districts.csv")
+    print("    S1b output/S1b_rf_importances_swing_no_party.csv")
+    print("    S2  output/S2_age_5yr_bins.csv")
+    print("    S3  output/S3_power_analysis.csv")
+    print("    S3b output/S3_religion_breakdown.csv")
+    print("    LC  output/learning_curve_rf.csv")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    main()
